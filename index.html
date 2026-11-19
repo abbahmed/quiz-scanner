@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Quiz Answerer</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0b1120; color: #f8fafc; margin: 0; padding: 14px; }
+  h2 { margin: 0 0 10px; font-size: 17px; color: #38bdf8; display: flex; justify-content: space-between; align-items: center; }
+  .badge { font-size: 11px; background: #1e293b; color: #94a3b8; padding: 3px 8px; border-radius: 99px; }
+  .row { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  input[type="password"], input[type="text"], input[type="number"] {
+    flex: 1; min-width: 120px; padding: 10px; border-radius: 8px;
+    border: 1px solid #334155; background: #1e293b; color: #fff; font-size: 14px;
+  }
+  button { padding: 13px 16px; border-radius: 10px; border: none; font-weight: 700; font-size: 15px; cursor: pointer; }
+  #startBtn { background: #22c55e; color: #052e16; flex: 1; }
+  #stopBtn { background: #ef4444; color: #fff; display: none; flex: 1; }
+  #answerBox {
+    background: #1e293b; border: 2px solid #38bdf8; border-radius: 12px;
+    padding: 14px; margin: 10px 0; font-size: 20px; font-weight: 700;
+    min-height: 52px; line-height: 1.35; word-break: break-word;
+  }
+  #answerBox.flag { border-color: #f59e0b; background: #451a03; }
+  #status { font-size: 12px; color: #94a3b8; margin-bottom: 10px; font-family: ui-monospace, monospace; }
+  .viewfinder { position: relative; width: 100%; border-radius: 10px; overflow: hidden; border: 1px solid #334155; background: #000; }
+  video { width: 100%; display: block; max-height: 38vh; object-fit: cover; }
+  #logBox { margin-top: 10px; background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 8px; font-family: ui-monospace, monospace; font-size: 11px; color: #cbd5e1; max-height: 120px; overflow-y: auto; }
+  canvas { display: none; }
+</style>
+</head>
+<body>
+  <h2>
+    <span>iPhone Quiz Answerer</span>
+    <span class="badge" id="wakeBadge">WakeLock: Off</span>
+  </h2>
+
+  <div class="row">
+    <input id="apiKey" type="password" placeholder="Gemini API Key (AIza...)" />
+    <input id="ntfyTopic" type="text" value="quiz-test-7391-xyz" placeholder="ntfy topic" />
+  </div>
+
+  <div class="row" style="align-items:center;">
+    <label style="font-size:13px; display:flex; align-items:center; gap:6px;">
+      <input type="checkbox" id="qaMode" checked /> QA Flag Mode
+    </label>
+    <label style="font-size:13px; display:flex; align-items:center; gap:6px; margin-left:auto;">
+      Trigger %:
+      <input id="thresh" type="number" step="0.2" value="1.5" style="width:64px; min-width:auto; padding:6px;" />
+    </label>
+  </div>
+
+  <div class="row">
+    <button id="startBtn">Start Camera &amp; Watch</button>
+    <button id="stopBtn">Stop</button>
+  </div>
+
+  <div id="answerBox">Ready — aim at screen &amp; tap Start</div>
+  <div id="status">Idle</div>
+
+  <div class="viewfinder">
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+
+  <div id="logBox"></div>
+
+  <canvas id="diffCanvas" width="320" height="180"></canvas>
+  <canvas id="sendCanvas"></canvas>
+
+<script>
+const MODEL = 'gemini-3.5-flash-lite';
+const video = document.getElementById('video');
+const diffCanvas = document.getElementById('diffCanvas');
+const diffCtx = diffCanvas.getContext('2d', { willReadFrequently: true });
+const sendCanvas = document.getElementById('sendCanvas');
+const sendCtx = sendCanvas.getContext('2d');
+const answerBox = document.getElementById('answerBox');
+const statusEl = document.getElementById('status');
+const logBox = document.getElementById('logBox');
+const wakeBadge = document.getElementById('wakeBadge');
+const apiKeyInput = document.getElementById('apiKey');
+const ntfyInput = document.getElementById('ntfyTopic');
+
+apiKeyInput.value = localStorage.getItem('gemini_key') || '';
+ntfyInput.value = localStorage.getItem('ntfy_topic') || 'quiz-test-7391-xyz';
+apiKeyInput.addEventListener('change', () => localStorage.setItem('gemini_key', apiKeyInput.value.trim()));
+ntfyInput.addEventListener('change', () => localStorage.setItem('ntfy_topic', ntfyInput.value.trim()));
+
+let stream = null;
+let timer = null;
+let prevGray = null;
+let lastQId = null;
+let lastLine = null;
+let busy = false;
+let wakeLock = null;
+
+function addLog(msg) {
+  const t = new Date().toTimeString().slice(0, 8);
+  const div = document.createElement('div');
+  div.textContent = `[${t}] ${msg}`;
+  logBox.prepend(div);
+  if (logBox.children.length > 30) logBox.removeChild(logBox.lastChild);
+}
+
+async function requestWakeLock() {
+  if ('wakeLock' in navigator) {
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeBadge.textContent = 'WakeLock: ON';
+      wakeBadge.style.color = '#4ade80';
+      wakeLock.addEventListener('release', () => {
+        wakeBadge.textContent = 'WakeLock: Off';
+        wakeBadge.style.color = '#94a3b8';
+      });
+    } catch (e) {
+      addLog('WakeLock unavailable: ' + e.message);
+    }
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && stream) requestWakeLock();
+});
+
+function getGrayFrame() {
+  diffCtx.drawImage(video, 0, 0, 320, 180);
+  const data = diffCtx.getImageData(0, 0, 320, 180).data;
+  const gray = new Uint8Array(320 * 180);
+  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+    gray[j] = (data[i] * 77 + data[i + 1] * 150 + data[i + 2] * 29) >> 8;
+  }
+  return gray;
+}
+
+function calcChangePct(a, b) {
+  let changed = 0;
+  for (let i = 0; i < a.length; i++) {
+    if (Math.abs(a[i] - b[i]) > 26) changed++;
+  }
+  return (changed / a.length) * 100;
+}
+
+async function sendNtfy(line, isFlag) {
+  const topic = ntfyInput.value.trim();
+  if (!topic) return;
+  const t0 = performance.now();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
+        method: 'POST',
+        headers: {
+          'Title': line.slice(0, 120),
+          'Priority': isFlag ? 'high' : 'default',
+          'Tags': isFlag ? 'warning' : 'white_check_mark'
+        },
+        body: line
+      });
+      if (r.ok) {
+        addLog(`ntfy sent in ${Math.round(performance.now() - t0)}ms`);
+        return;
+      }
+    } catch (_) {}
+    await new Promise(r => setTimeout(r, 150));
+  }
+  addLog('ntfy delivery failed after retries');
+}
+
+async function queryGemini() {
+  if (busy) return;
+  busy = true;
+  const t0 = performance.now();
+  statusEl.textContent = 'Reading question with Gemini...';
+
+  try {
+    const scale = Math.min(1, 1024 / Math.max(video.videoWidth, video.videoHeight));
+    sendCanvas.width = Math.round(video.videoWidth * scale);
+    sendCanvas.height = Math.round(video.videoHeight * scale);
+    sendCtx.drawImage(video, 0, 0, sendCanvas.width, sendCanvas.height);
+    const b64 = sendCanvas.toDataURL('image/jpeg', 0.78).split(',')[1];
+
+    const qa = document.getElementById('qaMode').checked;
+    const prompt =
+      "Read the multiple-choice quiz question and options on screen.\n" +
+      "Output ONE complete single line in this exact format and nothing else:\n" +
+      "Q<number> | Answer: <Option Letter> (<Complete exact option text from screen>)\n" +
+      (qa ? "Only if the question is ambiguous, factually wrong, or has multiple valid answers, append: | QA FLAG: <short reason>\n" : "") +
+      "Example: Q14 | Answer: B (Quick Ratio)\n" +
+      "Rules:\n" +
+      "- Always include the full option text inside parentheses, never truncate.\n" +
+      "- If no question number is shown, write Q?.\n" +
+      "- If no unanswered quiz question is visible, reply ONLY: NO_QUESTION";
+
+    const resp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${encodeURIComponent(apiKeyInput.value.trim())}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ inline_data: { mime_type: 'image/jpeg', data: b64 } }, { text: prompt }] }],
+          generationConfig: { temperature: 0.0, maxOutputTokens: 1024 }
+        })
+      }
+    );
+
+    const json = await resp.json();
+    const raw = (json.candidates?.[0]?.content?.parts?.[0]?.text || '').trim().split('\n')[0].trim();
+    const ms = Math.round(performance.now() - t0);
+
+    if (!raw || raw.toUpperCase().includes('NO_QUESTION')) {
+      statusEl.textContent = `Checked (${ms}ms) — no question on screen`;
+      return;
+    }
+
+    const match = raw.match(/^(Q[^\s|]+)\s*\|\s*Answer:\s*([A-Z0-9]+)\s*\((.+)\)(.*)$/i);
+    if (!match) {
+      addLog(`Ignored incomplete: ${raw}`);
+      return;
+    }
+
+    const qId = match[1].toUpperCase();
+    const cleanLine = `${qId} | Answer: ${match[2].toUpperCase()} (${match[3].trim()})${match[4] ? ' ' + match[4].trim() : ''}`;
+
+    if ((qId !== 'Q?' && qId === lastQId) || cleanLine === lastLine) {
+      addLog(`Duplicate ${qId} suppressed`);
+      return;
+    }
+
+    lastQId = qId;
+    lastLine = cleanLine;
+    const isFlag = qa && cleanLine.toUpperCase().includes('QA FLAG');
+
+    answerBox.textContent = cleanLine;
+    answerBox.className = isFlag ? 'flag' : '';
+    statusEl.textContent = `Solved in ${ms}ms`;
+    addLog(cleanLine);
+
+    if (navigator.vibrate) navigator.vibrate(isFlag ? [150, 80, 150] : 80);
+    await sendNtfy(cleanLine, isFlag);
+  } catch (err) {
+    addLog('Error: ' + err.message);
+    statusEl.textContent = 'Error: ' + err.message;
+  } finally {
+    busy = false;
+  }
+}
+
+document.getElementById('startBtn').onclick = async () => {
+  if (!apiKeyInput.value.trim()) {
+    alert('Paste your Gemini API key first.');
+    return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    await requestWakeLock();
+
+    document.getElementById('startBtn').style.display = 'none';
+    document.getElementById('stopBtn').style.display = 'block';
+    addLog('Camera started (' + video.videoWidth + 'x' + video.videoHeight + ')');
+
+    await new Promise(r => setTimeout(r, 400));
+    prevGray = getGrayFrame();
+    await queryGemini();
+
+    timer = setInterval(async () => {
+      if (busy) return;
+      const curr = getGrayFrame();
+      const pct = calcChangePct(prevGray, curr);
+      const thresh = parseFloat(document.getElementById('thresh').value) || 1.5;
+
+      if (pct >= thresh) {
+        // Brief settle pause
+        prevGray = curr;
+        await new Promise(r => setTimeout(r, 200));
+        prevGray = getGrayFrame();
+        addLog(`Change ${pct.toFixed(2)}% -> checking...`);
+        await queryGemini();
+      } else {
+        statusEl.textContent = `Watching... diff=${pct.toFixed(2)}% (trigger=${thresh}%) | Last: ${lastQId || 'None'}`;
+      }
+    }, 300);
+  } catch (err) {
+    alert('Camera error (ensure page is opened over HTTPS): ' + err.message);
+  }
+};
+
+document.getElementById('stopBtn').onclick = () => {
+  clearInterval(timer);
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  document.getElementById('startBtn').style.display = 'block';
+  document.getElementById('stopBtn').style.display = 'none';
+  statusEl.textContent = 'Stopped';
+  addLog('Stopped');
+};
+</script>
+</body>
+</html>
