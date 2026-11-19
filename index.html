@@ -3,12 +3,13 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<title>Quiz Answerer</title>
+<title>Quiz Answerer (60m+)</title>
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0b1120; color: #f8fafc; margin: 0; padding: 14px; }
-  h2 { margin: 0 0 10px; font-size: 17px; color: #38bdf8; display: flex; justify-content: space-between; align-items: center; }
-  .badge { font-size: 11px; background: #1e293b; color: #94a3b8; padding: 3px 8px; border-radius: 99px; }
+  h2 { margin: 0 0 10px; font-size: 16px; color: #38bdf8; display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+  .badges { display: flex; gap: 6px; }
+  .badge { font-size: 11px; background: #1e293b; color: #94a3b8; padding: 3px 8px; border-radius: 99px; font-family: ui-monospace, monospace; }
   .row { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
   input[type="password"], input[type="text"], input[type="number"] {
     flex: 1; min-width: 120px; padding: 10px; border-radius: 8px;
@@ -25,15 +26,18 @@
   #answerBox.flag { border-color: #f59e0b; background: #451a03; }
   #status { font-size: 12px; color: #94a3b8; margin-bottom: 10px; font-family: ui-monospace, monospace; }
   .viewfinder { position: relative; width: 100%; border-radius: 10px; overflow: hidden; border: 1px solid #334155; background: #000; }
-  video { width: 100%; display: block; max-height: 38vh; object-fit: cover; }
+  video#video { width: 100%; display: block; max-height: 36vh; object-fit: cover; }
   #logBox { margin-top: 10px; background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 8px; font-family: ui-monospace, monospace; font-size: 11px; color: #cbd5e1; max-height: 120px; overflow-y: auto; }
   canvas { display: none; }
 </style>
 </head>
 <body>
   <h2>
-    <span>iPhone Quiz Answerer</span>
-    <span class="badge" id="wakeBadge">WakeLock: Off</span>
+    <span>Quiz Answerer</span>
+    <span class="badges">
+      <span class="badge" id="uptimeBadge">00:00:00</span>
+      <span class="badge" id="wakeBadge">Awake: Off</span>
+    </span>
   </h2>
 
   <div class="row">
@@ -52,11 +56,11 @@
   </div>
 
   <div class="row">
-    <button id="startBtn">Start Camera &amp; Watch</button>
+    <button id="startBtn">Start Camera &amp; Watch (60m+)</button>
     <button id="stopBtn">Stop</button>
   </div>
 
-  <div id="answerBox">Ready — aim at screen &amp; tap Start</div>
+  <div id="answerBox">Ready — plug iPhone into power &amp; tap Start</div>
   <div id="status">Idle</div>
 
   <div class="viewfinder">
@@ -70,6 +74,7 @@
 
 <script>
 const MODEL = 'gemini-3.5-flash-lite';
+const POLL_MS = 300;
 const video = document.getElementById('video');
 const diffCanvas = document.getElementById('diffCanvas');
 const diffCtx = diffCanvas.getContext('2d', { willReadFrequently: true });
@@ -79,6 +84,7 @@ const answerBox = document.getElementById('answerBox');
 const statusEl = document.getElementById('status');
 const logBox = document.getElementById('logBox');
 const wakeBadge = document.getElementById('wakeBadge');
+const uptimeBadge = document.getElementById('uptimeBadge');
 const apiKeyInput = document.getElementById('apiKey');
 const ntfyInput = document.getElementById('ntfyTopic');
 
@@ -88,49 +94,117 @@ apiKeyInput.addEventListener('change', () => localStorage.setItem('gemini_key', 
 ntfyInput.addEventListener('change', () => localStorage.setItem('ntfy_topic', ntfyInput.value.trim()));
 
 let stream = null;
-let timer = null;
-let prevGray = null;
+let running = false;
+let loopTimeout = null;
+let uptimeTimer = null;
+let startTimeMs = 0;
+let prevGray = new Uint8Array(320 * 180);
+let currGray = new Uint8Array(320 * 180);
+let hasPrevFrame = false;
 let lastQId = null;
 let lastLine = null;
 let busy = false;
 let wakeLock = null;
+let keepAliveAudioCtx = null;
 
 function addLog(msg) {
   const t = new Date().toTimeString().slice(0, 8);
   const div = document.createElement('div');
   div.textContent = `[${t}] ${msg}`;
   logBox.prepend(div);
-  if (logBox.children.length > 30) logBox.removeChild(logBox.lastChild);
+  while (logBox.children.length > 25) logBox.removeChild(logBox.lastChild);
 }
 
-async function requestWakeLock() {
+function formatUptime(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  const h = String(Math.floor(totalSec / 3600)).padStart(2, '0');
+  const m = String(Math.floor((totalSec % 3600) / 60)).padStart(2, '0');
+  const s = String(totalSec % 60).padStart(2, '0');
+  return `${h}:${m}:${s}`;
+}
+
+// Layer 1 + Layer 2 Keep-Awake: Screen Wake Lock + silent WebAudio heartbeat
+async function enableKeepAwake() {
   if ('wakeLock' in navigator) {
     try {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeBadge.textContent = 'WakeLock: ON';
-      wakeBadge.style.color = '#4ade80';
-      wakeLock.addEventListener('release', () => {
-        wakeBadge.textContent = 'WakeLock: Off';
-        wakeBadge.style.color = '#94a3b8';
-      });
+      if (!wakeLock || wakeLock.released) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeBadge.textContent = 'Awake: LOCK';
+        wakeBadge.style.color = '#4ade80';
+        wakeLock.addEventListener('release', () => {
+          wakeBadge.textContent = 'Awake: Re-locking';
+          wakeBadge.style.color = '#facc15';
+          if (running && document.visibilityState === 'visible') {
+            setTimeout(enableKeepAwake, 500);
+          }
+        });
+      }
     } catch (e) {
-      addLog('WakeLock unavailable: ' + e.message);
+      wakeBadge.textContent = 'Awake: Fallback';
+      wakeBadge.style.color = '#38bdf8';
+    }
+  }
+
+  // Silent WebAudio oscillator prevents Safari tab suspension over 60+ min
+  try {
+    if (!keepAliveAudioCtx) {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      keepAliveAudioCtx = new AudioCtx();
+      const osc = keepAliveAudioCtx.createOscillator();
+      const gain = keepAliveAudioCtx.createGain();
+      gain.gain.value = 0.0001; // Inaudible
+      osc.connect(gain);
+      gain.connect(keepAliveAudioCtx.destination);
+      osc.start();
+    } else if (keepAliveAudioCtx.state === 'suspended') {
+      await keepAliveAudioCtx.resume();
+    }
+  } catch (_) {}
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && running) {
+    enableKeepAwake();
+    ensureCameraAlive();
+  }
+});
+
+async function startCameraStream() {
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+  }
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    audio: false
+  });
+  const track = stream.getVideoTracks()[0];
+  track.addEventListener('ended', () => {
+    addLog('Camera track ended — auto-restarting...');
+    if (running) setTimeout(ensureCameraAlive, 500);
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+async function ensureCameraAlive() {
+  if (!running) return;
+  const track = stream?.getVideoTracks()?.[0];
+  if (!track || track.readyState !== 'live' || video.paused) {
+    try {
+      await startCameraStream();
+      addLog('Camera stream restored');
+    } catch (e) {
+      addLog('Camera restart retry: ' + e.message);
     }
   }
 }
 
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && stream) requestWakeLock();
-});
-
-function getGrayFrame() {
+function captureGrayInto(targetBuf) {
   diffCtx.drawImage(video, 0, 0, 320, 180);
   const data = diffCtx.getImageData(0, 0, 320, 180).data;
-  const gray = new Uint8Array(320 * 180);
   for (let i = 0, j = 0; i < data.length; i += 4, j++) {
-    gray[j] = (data[i] * 77 + data[i + 1] * 150 + data[i + 2] * 29) >> 8;
+    targetBuf[j] = (data[i] * 77 + data[i + 1] * 150 + data[i + 2] * 29) >> 8;
   }
-  return gray;
 }
 
 function calcChangePct(a, b) {
@@ -163,11 +237,11 @@ async function sendNtfy(line, isFlag) {
     } catch (_) {}
     await new Promise(r => setTimeout(r, 150));
   }
-  addLog('ntfy delivery failed after retries');
+  addLog('ntfy failed after 3 attempts');
 }
 
 async function queryGemini() {
-  if (busy) return;
+  if (busy || !video.videoWidth) return;
   busy = true;
   const t0 = performance.now();
   statusEl.textContent = 'Reading question with Gemini...';
@@ -191,10 +265,14 @@ async function queryGemini() {
       "- If no question number is shown, write Q?.\n" +
       "- If no unanswered quiz question is visible, reply ONLY: NO_QUESTION";
 
+    const controller = new AbortController();
+    const fetchTimeout = setTimeout(() => controller.abort(), 12000);
+
     const resp = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${encodeURIComponent(apiKeyInput.value.trim())}`,
       {
         method: 'POST',
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ inline_data: { mime_type: 'image/jpeg', data: b64 } }, { text: prompt }] }],
@@ -202,6 +280,7 @@ async function queryGemini() {
         })
       }
     );
+    clearTimeout(fetchTimeout);
 
     const json = await resp.json();
     const raw = (json.candidates?.[0]?.content?.parts?.[0]?.text || '').trim().split('\n')[0].trim();
@@ -245,55 +324,83 @@ async function queryGemini() {
   }
 }
 
+async function watchLoop() {
+  if (!running) return;
+  try {
+    if (!busy) {
+      await ensureCameraAlive();
+      if (!hasPrevFrame) {
+        captureGrayInto(prevGray);
+        hasPrevFrame = true;
+      } else {
+        captureGrayInto(currGray);
+        const pct = calcChangePct(prevGray, currGray);
+        const thresh = parseFloat(document.getElementById('thresh').value) || 1.5;
+
+        if (pct >= thresh) {
+          prevGray.set(currGray);
+          await new Promise(r => setTimeout(r, 200));
+          captureGrayInto(prevGray);
+          addLog(`Change ${pct.toFixed(2)}% -> checking...`);
+          await queryGemini();
+        } else {
+          statusEl.textContent = `Watching... diff=${pct.toFixed(2)}% (trigger=${thresh}%) | Last: ${lastQId || 'None'}`;
+        }
+      }
+    }
+  } catch (e) {
+    addLog('Loop warn: ' + e.message);
+  }
+  if (running) {
+    loopTimeout = setTimeout(watchLoop, POLL_MS);
+  }
+}
+
 document.getElementById('startBtn').onclick = async () => {
   if (!apiKeyInput.value.trim()) {
     alert('Paste your Gemini API key first.');
     return;
   }
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-      audio: false
-    });
-    video.srcObject = stream;
-    await video.play();
-    await requestWakeLock();
+    running = true;
+    hasPrevFrame = false;
+    startTimeMs = Date.now();
+
+    await startCameraStream();
+    await enableKeepAwake();
 
     document.getElementById('startBtn').style.display = 'none';
     document.getElementById('stopBtn').style.display = 'block';
-    addLog('Camera started (' + video.videoWidth + 'x' + video.videoHeight + ')');
+    addLog('Started (' + video.videoWidth + 'x' + video.videoHeight + ')');
+
+    uptimeTimer = setInterval(() => {
+      uptimeBadge.textContent = formatUptime(Date.now() - startTimeMs);
+      // Re-assert Wake Lock every 60s in case iOS dropped it silently
+      if (running && (!wakeLock || wakeLock.released)) enableKeepAwake();
+    }, 1000);
 
     await new Promise(r => setTimeout(r, 400));
-    prevGray = getGrayFrame();
+    captureGrayInto(prevGray);
+    hasPrevFrame = true;
     await queryGemini();
 
-    timer = setInterval(async () => {
-      if (busy) return;
-      const curr = getGrayFrame();
-      const pct = calcChangePct(prevGray, curr);
-      const thresh = parseFloat(document.getElementById('thresh').value) || 1.5;
-
-      if (pct >= thresh) {
-        // Brief settle pause
-        prevGray = curr;
-        await new Promise(r => setTimeout(r, 200));
-        prevGray = getGrayFrame();
-        addLog(`Change ${pct.toFixed(2)}% -> checking...`);
-        await queryGemini();
-      } else {
-        statusEl.textContent = `Watching... diff=${pct.toFixed(2)}% (trigger=${thresh}%) | Last: ${lastQId || 'None'}`;
-      }
-    }, 300);
+    loopTimeout = setTimeout(watchLoop, POLL_MS);
   } catch (err) {
+    running = false;
     alert('Camera error (ensure page is opened over HTTPS): ' + err.message);
   }
 };
 
 document.getElementById('stopBtn').onclick = () => {
-  clearInterval(timer);
+  running = false;
+  clearTimeout(loopTimeout);
+  clearInterval(uptimeTimer);
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null;
   if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  if (keepAliveAudioCtx) { keepAliveAudioCtx.close(); keepAliveAudioCtx = null; }
+  wakeBadge.textContent = 'Awake: Off';
+  wakeBadge.style.color = '#94a3b8';
   document.getElementById('startBtn').style.display = 'block';
   document.getElementById('stopBtn').style.display = 'none';
   statusEl.textContent = 'Stopped';
