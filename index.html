@@ -102,7 +102,7 @@ let prevGray = new Uint8Array(320 * 180);
 let currGray = new Uint8Array(320 * 180);
 let hasPrevFrame = false;
 let lastQId = null;
-let lastLine = null;
+let lastAnswerCore = null;
 let busy = false;
 let wakeLock = null;
 let keepAliveAudioCtx = null;
@@ -123,7 +123,10 @@ function formatUptime(ms) {
   return `${h}:${m}:${s}`;
 }
 
-// Layer 1 + Layer 2 Keep-Awake: Screen Wake Lock + silent WebAudio heartbeat
+function normalizeAnswerCore(optionText) {
+  return optionText.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 async function enableKeepAwake() {
   if ('wakeLock' in navigator) {
     try {
@@ -145,14 +148,13 @@ async function enableKeepAwake() {
     }
   }
 
-  // Silent WebAudio oscillator prevents Safari tab suspension over 60+ min
   try {
     if (!keepAliveAudioCtx) {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       keepAliveAudioCtx = new AudioCtx();
       const osc = keepAliveAudioCtx.createOscillator();
       const gain = keepAliveAudioCtx.createGain();
-      gain.gain.value = 0.0001; // Inaudible
+      gain.gain.value = 0.0001;
       osc.connect(gain);
       gain.connect(keepAliveAudioCtx.destination);
       osc.start();
@@ -221,13 +223,15 @@ async function sendNtfy(line, isFlag) {
   const t0 = performance.now();
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      const headers = {
+        'Priority': isFlag ? 'high' : 'default',
+        'Tags': isFlag ? 'warning' : 'white_check_mark'
+      };
+      if (isFlag) headers['Title'] = 'QA FLAG';
+
       const r = await fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
         method: 'POST',
-        headers: {
-          'Title': line.slice(0, 120),
-          'Priority': isFlag ? 'high' : 'default',
-          'Tags': isFlag ? 'warning' : 'white_check_mark'
-        },
+        headers,
         body: line
       });
       if (r.ok) {
@@ -298,15 +302,19 @@ async function queryGemini() {
     }
 
     const qId = match[1].toUpperCase();
-    const cleanLine = `${qId} | Answer: ${match[2].toUpperCase()} (${match[3].trim()})${match[4] ? ' ' + match[4].trim() : ''}`;
+    const optLetter = match[2].toUpperCase();
+    const optText = match[3].trim();
+    const tail = match[4] ? ' ' + match[4].trim() : '';
+    const cleanLine = `${qId} | Answer: ${optLetter} (${optText})${tail}`;
+    const answerCore = normalizeAnswerCore(optText);
 
-    if ((qId !== 'Q?' && qId === lastQId) || cleanLine === lastLine) {
-      addLog(`Duplicate ${qId} suppressed`);
+    if ((qId !== 'Q?' && qId === lastQId) || (answerCore && answerCore === lastAnswerCore)) {
+      addLog(`Duplicate suppressed (${qId})`);
       return;
     }
 
     lastQId = qId;
-    lastLine = cleanLine;
+    lastAnswerCore = answerCore;
     const isFlag = qa && cleanLine.toUpperCase().includes('QA FLAG');
 
     answerBox.textContent = cleanLine;
@@ -375,7 +383,6 @@ document.getElementById('startBtn').onclick = async () => {
 
     uptimeTimer = setInterval(() => {
       uptimeBadge.textContent = formatUptime(Date.now() - startTimeMs);
-      // Re-assert Wake Lock every 60s in case iOS dropped it silently
       if (running && (!wakeLock || wakeLock.released)) enableKeepAwake();
     }, 1000);
 
